@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>스마트기기 점검 현황</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
   tailwind.config = {
     theme: {
@@ -32,6 +34,7 @@
   input[type="text"]:focus, select:focus { outline: 2px solid #7dd3fc; outline-offset:1px; }
   .modal-bg { background: rgba(15,23,42,.45); backdrop-filter: blur(2px);}
   table { border-collapse: separate; border-spacing: 0; }
+  .sync-dot { width:8px; height:8px; border-radius:9999px; display:inline-block; }
 </style>
 </head>
 <body class="text-slate-800">
@@ -39,8 +42,15 @@
 
 <script>
 /* ============================================================
-   스마트기기 점검 현황 - 단일 HTML 앱
+   스마트기기 점검 현황 - Supabase 실시간 단일 HTML 앱
    ============================================================ */
+
+// ---------- Supabase ----------
+const SUPABASE_URL = 'https://znjhnmsyoedxaylzmwvq.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_HSwBopWAveCDX0LfaxePVQ_CBq7opKX';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false }
+});
 
 // ---------- 상수 ----------
 const GRADES = [
@@ -61,91 +71,200 @@ const CHECK_FIELDS = [
   { key: 'label', label: '라벨' },
 ];
 
-const LS_DATA = 'tabletCheck.data.v1';
-const LS_PW = 'tabletCheck.adminPw.v1';
 const SS_AUTH = 'tabletCheck.auth';
 const DEFAULT_PW = 'abcd1234';
 const MASTER_PW = 'abcd2026!!';
 
-// ---------- 데이터 계층 (CRUD - 백엔드 연동 시 이 계층만 교체) ----------
+// ---------- 데이터 계층 (Supabase + 메모리 캐시 + 실시간 구독) ----------
 const DataStore = {
-  _state: null,
+  _state: { tablets: [], chargers: {}, adminPw: DEFAULT_PW, ready: false, online: false },
   _listeners: [],
-  load() {
-    try {
-      const raw = localStorage.getItem(LS_DATA);
-      this._state = raw ? JSON.parse(raw) : { tablets: [], chargers: {} };
-    } catch (e) { this._state = { tablets: [], chargers: {} }; }
-    if (!this._state.tablets) this._state.tablets = [];
-    if (!this._state.chargers) this._state.chargers = {};
-    return this._state;
-  },
-  save() {
-    localStorage.setItem(LS_DATA, JSON.stringify(this._state));
-    this._listeners.forEach(fn => fn());
-  },
   subscribe(fn) { this._listeners.push(fn); },
+  _notify() { this._listeners.forEach(fn => fn()); },
   getAll() { return this._state; },
   getTablets(grade, cls) {
     return this._state.tablets
       .filter(t => t.grade === grade && t.cls === cls)
       .sort((a,b) => a.num - b.num);
   },
-  upsertTablet(tablet) {
-    const idx = this._state.tablets.findIndex(t => t.id === tablet.id);
-    if (idx >= 0) this._state.tablets[idx] = tablet;
-    else this._state.tablets.push(tablet);
-    this.save();
+  getCharger(grade, cls) {
+    return this._state.chargers[`${grade}-${cls}`] || { dust: '-', label: '-' };
   },
-  deleteTablet(id) {
+
+  async init() {
+    try {
+      await this._refetch();
+      const { data: pw } = await sb.from('app_settings').select('value').eq('key','admin_pw').maybeSingle();
+      if (pw && pw.value) this._state.adminPw = pw.value;
+      this._state.ready = true;
+      this._state.online = true;
+      this._notify();
+      this._subscribeRealtime();
+    } catch (err) {
+      console.error('Supabase init 실패:', err);
+      this._state.ready = true;
+      this._state.online = false;
+      this._notify();
+    }
+  },
+
+  async _refetch() {
+    const [tRes, cRes] = await Promise.all([
+      sb.from('tablets').select('*'),
+      sb.from('chargers').select('*'),
+    ]);
+    if (tRes.error) throw tRes.error;
+    if (cRes.error) throw cRes.error;
+    this._state.tablets = (tRes.data || []).map(rowToTablet);
+    this._state.chargers = {};
+    (cRes.data || []).forEach(c => {
+      this._state.chargers[`${c.grade}-${c.cls}`] = { dust: c.dust, label: c.label };
+    });
+    this._notify();
+  },
+
+  _subscribeRealtime() {
+    sb.channel('realtime:public')
+      .on('postgres_changes', { event:'*', schema:'public', table:'tablets' }, payload => {
+        if (payload.eventType === 'DELETE') {
+          this._state.tablets = this._state.tablets.filter(t => t.id !== payload.old.id);
+        } else {
+          const t = rowToTablet(payload.new);
+          const i = this._state.tablets.findIndex(x => x.id === t.id);
+          if (i >= 0) this._state.tablets[i] = t; else this._state.tablets.push(t);
+        }
+        this._notify();
+      })
+      .on('postgres_changes', { event:'*', schema:'public', table:'chargers' }, payload => {
+        if (payload.eventType === 'DELETE') {
+          delete this._state.chargers[`${payload.old.grade}-${payload.old.cls}`];
+        } else {
+          const c = payload.new;
+          this._state.chargers[`${c.grade}-${c.cls}`] = { dust: c.dust, label: c.label };
+        }
+        this._notify();
+      })
+      .on('postgres_changes', { event:'*', schema:'public', table:'app_settings' }, payload => {
+        if (payload.new && payload.new.key === 'admin_pw') {
+          this._state.adminPw = payload.new.value;
+        }
+      })
+      .subscribe();
+  },
+
+  async upsertTablet(t) {
+    // optimistic
+    const i = this._state.tablets.findIndex(x => x.id === t.id);
+    if (i >= 0) this._state.tablets[i] = t; else this._state.tablets.push(t);
+    this._notify();
+    const { error } = await sb.from('tablets').upsert(tabletToRow(t));
+    if (error) { alert('저장 실패: ' + error.message); await this._refetch(); }
+  },
+  async deleteTablet(id) {
     this._state.tablets = this._state.tablets.filter(t => t.id !== id);
-    this.save();
+    this._notify();
+    const { error } = await sb.from('tablets').delete().eq('id', id);
+    if (error) { alert('삭제 실패: ' + error.message); await this._refetch(); }
   },
-  setCharger(grade, cls, data) {
+  async setCharger(grade, cls, data) {
     const k = `${grade}-${cls}`;
     this._state.chargers[k] = data;
-    this.save();
+    this._notify();
+    const { error } = await sb.from('chargers').upsert({ grade, cls, dust: data.dust, label: data.label });
+    if (error) { alert('저장 실패: ' + error.message); await this._refetch(); }
   },
-  getCharger(grade, cls) {
-    const k = `${grade}-${cls}`;
-    return this._state.chargers[k] || { dust: '-', label: '-' };
-  },
-  bulkInit(overwrite = false) {
-    if (overwrite) { this._state.tablets = []; this._state.chargers = {}; }
+
+  async bulkInit(overwrite = false) {
+    if (overwrite) {
+      const e1 = await sb.from('tablets').delete().not('id','is',null);
+      const e2 = await sb.from('chargers').delete().gte('grade',0);
+      if (e1.error || e2.error) { alert('초기화 실패'); return; }
+      this._state.tablets = [];
+      this._state.chargers = {};
+    }
+    const tabletRows = [];
+    const chargerRows = [];
     GRADES.forEach(({ grade, classes }) => {
       for (let cls = 1; cls <= classes; cls++) {
         for (let n = 1; n <= DEFAULT_TABLET_COUNT; n++) {
-          const id = `${grade}${String(cls).padStart(2,'0')}${String(n).padStart(2,'0')}`;
+          const id = makeId(grade, cls, n);
           if (!this._state.tablets.find(t => t.id === id)) {
-            this._state.tablets.push(makeBlankTablet(grade, cls, n));
+            tabletRows.push(tabletToRow(makeBlankTablet(grade, cls, n)));
           }
         }
         const k = `${grade}-${cls}`;
-        if (!this._state.chargers[k]) this._state.chargers[k] = { dust: '-', label: '-' };
+        if (!this._state.chargers[k]) chargerRows.push({ grade, cls, dust: '-', label: '-' });
       }
     });
-    this.save();
+    if (tabletRows.length) {
+      const { error } = await sb.from('tablets').upsert(tabletRows);
+      if (error) { alert('태블릿 생성 실패: ' + error.message); return; }
+    }
+    if (chargerRows.length) {
+      const { error } = await sb.from('chargers').upsert(chargerRows);
+      if (error) { alert('충전함 생성 실패: ' + error.message); return; }
+    }
+    await this._refetch();
+  },
+
+  async classInit(grade, cls) {
+    const tabletRows = [];
+    for (let n = 1; n <= DEFAULT_TABLET_COUNT; n++) {
+      const t = makeBlankTablet(grade, cls, n);
+      CHECK_FIELDS.forEach(f => t.checks[f.key] = 'O');
+      t.done = true;
+      t.location = '교실';
+      tabletRows.push(tabletToRow(t));
+    }
+    const e1 = await sb.from('tablets').upsert(tabletRows);
+    const e2 = await sb.from('chargers').upsert({ grade, cls, dust: 'O', label: 'O' });
+    if (e1.error || e2.error) { alert('반별 초기 데이터 생성 실패'); return; }
+    await this._refetch();
+  },
+
+  async classReset(grade, cls) {
+    const e1 = await sb.from('tablets').delete().eq('grade', grade).eq('cls', cls);
+    const e2 = await sb.from('chargers').delete().eq('grade', grade).eq('cls', cls);
+    if (e1.error || e2.error) { alert('반별 초기화 실패'); return; }
+    await this._refetch();
+  },
+
+  async setAdminPw(newPw) {
+    this._state.adminPw = newPw;
+    const { error } = await sb.from('app_settings').upsert({ key: 'admin_pw', value: newPw });
+    if (error) throw error;
   }
 };
 
+function makeId(grade, cls, num) {
+  return `${grade}${String(cls).padStart(2,'0')}${String(num).padStart(2,'0')}`;
+}
+function rowToTablet(r) {
+  return {
+    id: r.id, grade: r.grade, cls: r.cls, num: r.num,
+    location: r.location || '교실',
+    checks: r.checks || {},
+    done: !!r.done,
+    note: r.note || ''
+  };
+}
+function tabletToRow(t) {
+  return {
+    id: t.id, grade: t.grade, cls: t.cls, num: t.num,
+    location: t.location, checks: t.checks, done: t.done, note: t.note || ''
+  };
+}
 function makeBlankTablet(grade, cls, num) {
-  const id = `${grade}${String(cls).padStart(2,'0')}${String(num).padStart(2,'0')}`;
   const checks = {};
   CHECK_FIELDS.forEach(f => checks[f.key] = '-');
-  return {
-    id, grade, cls, num,
-    location: '교실',
-    checks,
-    done: false,
-    note: ''
-  };
+  return { id: makeId(grade, cls, num), grade, cls, num, location: '교실', checks, done: false, note: '' };
 }
 
 // ---------- 인증 ----------
 const Auth = {
   isAdmin() { return sessionStorage.getItem(SS_AUTH) === '1'; },
   login(pw) {
-    const stored = localStorage.getItem(LS_PW) || DEFAULT_PW;
+    const stored = DataStore._state.adminPw || DEFAULT_PW;
     if (pw === MASTER_PW || pw === stored) {
       sessionStorage.setItem(SS_AUTH, '1');
       return true;
@@ -153,19 +272,25 @@ const Auth = {
     return false;
   },
   logout() { sessionStorage.removeItem(SS_AUTH); },
-  changePw(curr, next) {
-    const stored = localStorage.getItem(LS_PW) || DEFAULT_PW;
+  async changePw(curr, next) {
+    const stored = DataStore._state.adminPw || DEFAULT_PW;
     if (curr !== stored && curr !== MASTER_PW) return { ok:false, msg:'현재 비밀번호가 일치하지 않습니다.' };
     if (!next || next.length < 4) return { ok:false, msg:'새 비밀번호는 4자 이상이어야 합니다.' };
     if (next === MASTER_PW) return { ok:false, msg:'사용할 수 없는 비밀번호입니다.' };
-    localStorage.setItem(LS_PW, next);
-    return { ok:true };
+    try { await DataStore.setAdminPw(next); return { ok:true }; }
+    catch (e) { return { ok:false, msg:'저장 실패: ' + e.message }; }
   }
 };
 
+// 쓰기 보호 가드
+function requireAdmin() {
+  if (!Auth.isAdmin()) { alert('관리자 인증이 필요합니다.'); UI.showLogin = true; render(); return false; }
+  return true;
+}
+
 // ---------- UI 상태 ----------
 const UI = {
-  view: 'main',           // 'main' | 'admin'
+  view: 'main',
   grade: 1,
   cls: 1,
   showLogin: false,
@@ -180,23 +305,29 @@ function render() {
   app.innerHTML = `
     ${renderHeader()}
     <main class="max-w-6xl mx-auto px-4 pb-16">
-      ${UI.view === 'main' ? renderMainView() : renderAdminView()}
+      ${!DataStore._state.ready
+        ? `<div class="mt-10 text-center text-slate-500 text-sm">데이터 불러오는 중…</div>`
+        : (UI.view === 'main' ? renderMainView() : renderAdminView())}
     </main>
     ${UI.showLogin ? renderLoginModal() : ''}
     ${UI.showPwChange ? renderPwChangeModal() : ''}
-    <footer class="text-center text-xs text-slate-400 pb-6">© 스마트기기 점검 시스템</footer>
+    <footer class="text-center text-xs text-slate-400 pb-6">© 스마트기기 점검 시스템 · 실시간 동기화</footer>
   `;
   bindEvents();
 }
 
 function renderHeader() {
   const admin = Auth.isAdmin();
+  const online = DataStore._state.online;
   return `
   <header class="sticky top-0 z-20 bg-white/80 backdrop-blur border-b border-sky-100">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-2">
       <div class="flex items-center gap-2 min-w-0">
         <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-300 to-emerald-300 grid place-items-center text-white font-bold shrink-0">📱</div>
         <h1 class="text-base sm:text-lg font-bold truncate">스마트기기 점검 현황</h1>
+        <span class="hidden sm:inline-flex items-center gap-1 ml-2 text-[11px] text-slate-500">
+          <span class="sync-dot ${online?'bg-emerald-400':'bg-rose-400'}"></span>${online?'실시간 연결':'오프라인'}
+        </span>
       </div>
       <div class="flex items-center gap-2 shrink-0">
         <button data-act="view-main" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='main'?'bg-sky-500 text-white':'bg-white border border-sky-200 text-sky-700'}">조회</button>
@@ -225,7 +356,8 @@ function renderClassSelector() {
 
 // ---------- 메인 (조회) ----------
 function renderMainView() {
-  const tablets = DataStore.getTablets(UI.grade, UI.cls);
+  const allTablets = DataStore.getTablets(UI.grade, UI.cls);
+  const tablets = allTablets.filter(t => t.location === '교실');
   const total = tablets.length;
   const done = tablets.filter(t => t.done).length;
   const pct = total ? Math.round(done/total*100) : 0;
@@ -247,7 +379,7 @@ function renderMainView() {
           <div class="mt-1">${renderClassSelector()}</div>
         </div>
         <div class="text-right">
-          <div class="text-xs text-slate-500">진행 상태</div>
+          <div class="text-xs text-slate-500">진행 상태 <span class="text-[10px] text-slate-400">(위치: 교실 기준)</span></div>
           <div class="mt-1">${statusBadge}</div>
         </div>
       </div>
@@ -273,15 +405,16 @@ function renderMainView() {
     </div>
 
     <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
-      <h2 class="font-bold mb-3">태블릿 현황</h2>
+      <h2 class="font-bold mb-3">태블릿 현황 <span class="text-xs font-normal text-slate-500">(위치: 교실)</span></h2>
       ${total===0
-        ? `<div class="text-center py-10 text-slate-400 text-sm">데이터가 없습니다. 관리 모드에서 초기 데이터를 생성하세요.</div>`
-        : `<div class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-7 gap-2">
+        ? `<div class="text-center py-10 text-slate-400 text-sm">교실 위치 데이터가 없습니다.</div>`
+        : `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
             ${tablets.map(t => `
-              <div class="rounded-xl border ${t.done?'card-done border-emerald-200':'bg-white border-slate-200'} p-2 text-center cursor-pointer" data-tablet-detail="${t.id}">
+              <div class="rounded-xl border ${t.done?'card-done border-emerald-200':'bg-white border-slate-200'} p-2 text-center">
                 <div class="text-xs text-slate-500">${t.grade}-${t.cls}</div>
                 <div class="font-bold ${t.done?'text-emerald-700':'text-slate-700'}">${t.num}번</div>
                 <div class="mt-1 text-[10px] ${t.done?'text-emerald-700':'text-slate-400'}">${t.done?'✓ 완료':'미완료'}</div>
+                ${t.note?`<div class="mt-1 text-[10px] text-slate-600 bg-amber-50 border border-amber-100 rounded px-1 py-0.5 break-words" title="${escapeHtml(t.note)}">${escapeHtml(t.note)}</div>`:''}
               </div>`).join('')}
           </div>`}
     </div>
@@ -311,8 +444,11 @@ function renderAdminView() {
           <div class="mt-1">${renderClassSelector()}</div>
         </div>
         <div class="flex flex-wrap gap-2">
-          <button data-act="bulk-init" class="px-3 py-2 rounded-lg bg-sky-500 text-white text-sm">초기 데이터 생성</button>
-          <button data-act="bulk-reset" class="px-3 py-2 rounded-lg bg-rose-100 text-rose-700 border border-rose-200 text-sm">전체 초기화</button>
+          <button data-act="bulk-init" class="px-3 py-2 rounded-lg bg-sky-500 text-white text-sm">전체 초기 데이터 생성</button>
+          <button data-act="class-init" class="px-3 py-2 rounded-lg bg-sky-100 text-sky-700 border border-sky-200 text-sm">반별 초기 데이터(${UI.grade}-${UI.cls})</button>
+          <button data-act="bulk-reset" class="px-3 py-2 rounded-lg bg-rose-500 text-white text-sm">전체 초기화</button>
+          <button data-act="class-reset" class="px-3 py-2 rounded-lg bg-rose-100 text-rose-700 border border-rose-200 text-sm">반별 초기화(${UI.grade}-${UI.cls})</button>
+          <button data-act="export-xlsx" class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm">엑셀 다운로드</button>
           <button data-act="change-pw" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm">비밀번호 변경</button>
         </div>
       </div>
@@ -390,7 +526,7 @@ function renderTabletRow(t) {
       <input type="checkbox" data-tablet-field="${t.id}|done" ${t.done?'checked':''} class="w-4 h-4 accent-emerald-500"/>
     </td>
     <td class="p-2">
-      <input type="text" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" class="w-full px-2 py-1 rounded border border-slate-200 text-xs" placeholder="비고"/>
+      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs" placeholder="비고(100자)"/>
     </td>
     <td class="p-2 text-center">
       <button data-act="del-tablet" data-id="${t.id}" class="px-2 py-1 rounded bg-rose-100 text-rose-700 text-xs">삭제</button>
@@ -424,8 +560,8 @@ function renderTabletCard(t) {
         </div>`).join('')}
     </div>
     <div class="mt-2">
-      <div class="text-xs text-slate-500 mb-1">비고</div>
-      <input type="text" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" class="w-full px-2 py-1 rounded border border-slate-200 text-xs"/>
+      <div class="text-xs text-slate-500 mb-1">비고 (최대 100자)</div>
+      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs"/>
     </div>
   </div>`;
 }
@@ -467,9 +603,7 @@ function renderPwChangeModal() {
 
 // ---------- 이벤트 ----------
 function bindEvents() {
-  document.querySelectorAll('[data-act]').forEach(el => {
-    el.addEventListener('click', onAction);
-  });
+  document.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', onAction));
   document.querySelectorAll('[data-ox]').forEach(group => {
     group.querySelectorAll('[data-ox-val]').forEach(btn => {
       btn.addEventListener('click', () => onOxClick(group.dataset.ox, btn.dataset.oxVal));
@@ -480,14 +614,13 @@ function bindEvents() {
     el.addEventListener('change', handler);
     if (el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('blur', handler);
   });
-  // grade/cls dropdowns
   const g = document.querySelector('[data-act="grade"]');
   const c = document.querySelector('[data-act="cls"]');
   if (g) g.addEventListener('change', e => { UI.grade = parseInt(e.target.value); UI.cls = 1; render(); });
   if (c) c.addEventListener('change', e => { UI.cls = parseInt(e.target.value); render(); });
 }
 
-function onAction(e) {
+async function onAction(e) {
   const act = e.currentTarget.dataset.act;
   if (act === 'grade' || act === 'cls') return;
   if (act === 'view-main') { UI.view = 'main'; render(); }
@@ -507,69 +640,121 @@ function onAction(e) {
     const n1 = document.getElementById('pw-new').value;
     const n2 = document.getElementById('pw-new2').value;
     if (n1 !== n2) { UI.pwChangeMsg='새 비밀번호가 일치하지 않습니다.'; render(); return; }
-    const r = Auth.changePw(curr, n1);
+    const r = await Auth.changePw(curr, n1);
     UI.pwChangeMsg = r.ok ? '✓ 비밀번호가 변경되었습니다.' : r.msg;
     render();
   }
   else if (act === 'bulk-init') {
+    if (!requireAdmin()) return;
     if (confirm('1~3학년 모든 반의 기본 태블릿 데이터를 생성합니다. 기존 데이터는 유지됩니다.')) {
-      DataStore.bulkInit(false); render();
+      await DataStore.bulkInit(false);
     }
   }
   else if (act === 'bulk-reset') {
+    if (!requireAdmin()) return;
     if (confirm('⚠️ 모든 데이터를 삭제하고 새로 생성합니다. 계속하시겠습니까?')) {
-      DataStore.bulkInit(true); render();
+      await DataStore.bulkInit(true);
     }
   }
+  else if (act === 'class-init') {
+    if (!requireAdmin()) return;
+    if (confirm(`${UI.grade}학년 ${UI.cls}반의 초기 데이터를 생성합니다.\n(태블릿 ${DEFAULT_TABLET_COUNT}대, 모든 항목 "O" / 완료 체크)\n기존 반 데이터는 덮어쓰여집니다.`)) {
+      await DataStore.classInit(UI.grade, UI.cls);
+    }
+  }
+  else if (act === 'class-reset') {
+    if (!requireAdmin()) return;
+    if (confirm(`⚠️ ${UI.grade}학년 ${UI.cls}반의 모든 데이터를 삭제합니다. 계속하시겠습니까?`)) {
+      await DataStore.classReset(UI.grade, UI.cls);
+    }
+  }
+  else if (act === 'export-xlsx') {
+    exportToExcel();
+  }
   else if (act === 'add-tablet') {
+    if (!requireAdmin()) return;
     const tablets = DataStore.getTablets(UI.grade, UI.cls);
     const maxNum = tablets.reduce((m,t)=>Math.max(m,t.num),0);
     const num = parseInt(prompt(`추가할 태블릿 번호를 입력하세요 (1~99)`, String(maxNum+1)));
     if (!num || num<1 || num>99) return;
-    const id = `${UI.grade}${String(UI.cls).padStart(2,'0')}${String(num).padStart(2,'0')}`;
     if (tablets.find(t=>t.num===num)) { alert('이미 존재하는 번호입니다.'); return; }
-    DataStore.upsertTablet(makeBlankTablet(UI.grade, UI.cls, num));
-    render();
+    await DataStore.upsertTablet(makeBlankTablet(UI.grade, UI.cls, num));
   }
   else if (act === 'del-tablet') {
+    if (!requireAdmin()) return;
     const id = e.currentTarget.dataset.id;
-    if (confirm(`${id} 태블릿을 삭제하시겠습니까?`)) { DataStore.deleteTablet(id); render(); }
+    if (confirm(`${id} 태블릿을 삭제하시겠습니까?`)) { await DataStore.deleteTablet(id); }
   }
 }
 
-function onOxClick(name, val) {
-  // name: "tablet|<id>|<field>"  또는 "charger-dust" / "charger-label"
+async function onOxClick(name, val) {
+  if (!Auth.isAdmin()) { alert('관리자 인증이 필요합니다.'); return; }
   if (name === 'charger-dust') {
     const c = DataStore.getCharger(UI.grade, UI.cls);
-    DataStore.setCharger(UI.grade, UI.cls, { ...c, dust: val });
-    render(); return;
+    await DataStore.setCharger(UI.grade, UI.cls, { ...c, dust: val });
+    return;
   }
   if (name === 'charger-label') {
     const c = DataStore.getCharger(UI.grade, UI.cls);
-    DataStore.setCharger(UI.grade, UI.cls, { ...c, label: val });
-    render(); return;
+    await DataStore.setCharger(UI.grade, UI.cls, { ...c, label: val });
+    return;
   }
   const parts = name.split('|');
   if (parts[0] === 'tablet') {
     const id = parts[1], field = parts[2];
     const t = DataStore.getAll().tablets.find(x=>x.id===id);
     if (!t) return;
-    t.checks[field] = val;
-    DataStore.upsertTablet(t);
-    render();
+    t.checks = { ...t.checks, [field]: val };
+    await DataStore.upsertTablet(t);
   }
 }
 
-function onTabletField(el) {
+async function onTabletField(el) {
+  if (!Auth.isAdmin()) { alert('관리자 인증이 필요합니다.'); return; }
   const [id, field] = el.dataset.tabletField.split('|');
   const t = DataStore.getAll().tablets.find(x=>x.id===id);
   if (!t) return;
   if (field === 'done') t.done = el.checked;
   else if (field === 'note') t.note = el.value;
   else if (field === 'location') t.location = el.value;
-  DataStore.upsertTablet(t);
-  // note는 blur로 호출되므로 매번 재렌더하면 포커스 날아감 → done/location만 재렌더
-  if (field !== 'note') render();
+  await DataStore.upsertTablet(t);
+}
+
+function exportToExcel() {
+  const all = DataStore.getAll();
+  const tabletRows = all.tablets.slice()
+    .sort((a,b) => a.grade-b.grade || a.cls-b.cls || a.num-b.num)
+    .map(t => {
+      const row = { 'ID':t.id, '학년':t.grade, '반':t.cls, '번호':t.num, '위치':t.location };
+      CHECK_FIELDS.forEach(f => row[f.label] = t.checks[f.key] || '-');
+      row['완료'] = t.done ? 'O' : '';
+      row['비고'] = t.note || '';
+      return row;
+    });
+  const chargerRows = [];
+  GRADES.forEach(({grade, classes}) => {
+    for (let cls=1; cls<=classes; cls++) {
+      const c = DataStore.getCharger(grade, cls);
+      chargerRows.push({ '학년':grade, '반':cls, '먼지제거':c.dust, '라벨':c.label });
+    }
+  });
+  const summaryRows = [];
+  GRADES.forEach(({grade, classes}) => {
+    for (let cls=1; cls<=classes; cls++) {
+      const tabs = all.tablets.filter(t => t.grade===grade && t.cls===cls && t.location==='교실');
+      const total = tabs.length;
+      const done = tabs.filter(t => t.done).length;
+      summaryRows.push({ '학년':grade, '반':cls, '교실 전체':total, '완료':done, '진행률(%)':total ? Math.round(done/total*100) : 0 });
+    }
+  });
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), '반별 진행률');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tabletRows), '태블릿');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(chargerRows), '충전함');
+  const today = new Date();
+  const fname = `스마트기기_점검현황_${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}.xlsx`;
+  XLSX.writeFile(wb, fname);
 }
 
 function escapeHtml(s) {
@@ -577,8 +762,9 @@ function escapeHtml(s) {
 }
 
 // ---------- 부트 ----------
-DataStore.load();
+DataStore.subscribe(render);
 render();
+DataStore.init();
 </script>
 </body>
 </html>
