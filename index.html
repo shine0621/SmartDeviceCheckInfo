@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>스마트기기 점검 현황</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script>
   tailwind.config = {
     theme: {
@@ -126,25 +125,6 @@ const DataStore = {
       }
     });
     this.save();
-  },
-  classReset(grade, cls) {
-    this._state.tablets = this._state.tablets.filter(t => !(t.grade===grade && t.cls===cls));
-    delete this._state.chargers[`${grade}-${cls}`];
-    this.save();
-  },
-  classInit(grade, cls) {
-    // 해당 반의 기본 29대를 모두 "O" + 완료 상태로 생성/갱신
-    for (let n = 1; n <= DEFAULT_TABLET_COUNT; n++) {
-      const t = makeBlankTablet(grade, cls, n);
-      CHECK_FIELDS.forEach(f => t.checks[f.key] = 'O');
-      t.done = true;
-      t.location = '교실';
-      const idx = this._state.tablets.findIndex(x => x.id === t.id);
-      if (idx >= 0) this._state.tablets[idx] = t;
-      else this._state.tablets.push(t);
-    }
-    this._state.chargers[`${grade}-${cls}`] = { dust: 'O', label: 'O' };
-    this.save();
   }
 };
 
@@ -245,8 +225,7 @@ function renderClassSelector() {
 
 // ---------- 메인 (조회) ----------
 function renderMainView() {
-  const allTablets = DataStore.getTablets(UI.grade, UI.cls);
-  const tablets = allTablets.filter(t => t.location === '교실');
+  const tablets = DataStore.getTablets(UI.grade, UI.cls);
   const total = tablets.length;
   const done = tablets.filter(t => t.done).length;
   const pct = total ? Math.round(done/total*100) : 0;
@@ -268,7 +247,7 @@ function renderMainView() {
           <div class="mt-1">${renderClassSelector()}</div>
         </div>
         <div class="text-right">
-          <div class="text-xs text-slate-500">진행 상태 <span class="text-[10px] text-slate-400">(위치: 교실 기준)</span></div>
+          <div class="text-xs text-slate-500">진행 상태</div>
           <div class="mt-1">${statusBadge}</div>
         </div>
       </div>
@@ -294,16 +273,15 @@ function renderMainView() {
     </div>
 
     <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
-      <h2 class="font-bold mb-3">태블릿 현황 <span class="text-xs font-normal text-slate-500">(위치: 교실)</span></h2>
+      <h2 class="font-bold mb-3">태블릿 현황</h2>
       ${total===0
-        ? `<div class="text-center py-10 text-slate-400 text-sm">교실 위치 데이터가 없습니다.</div>`
-        : `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
+        ? `<div class="text-center py-10 text-slate-400 text-sm">데이터가 없습니다. 관리 모드에서 초기 데이터를 생성하세요.</div>`
+        : `<div class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-7 gap-2">
             ${tablets.map(t => `
-              <div class="rounded-xl border ${t.done?'card-done border-emerald-200':'bg-white border-slate-200'} p-2 text-center" data-tablet-detail="${t.id}">
+              <div class="rounded-xl border ${t.done?'card-done border-emerald-200':'bg-white border-slate-200'} p-2 text-center cursor-pointer" data-tablet-detail="${t.id}">
                 <div class="text-xs text-slate-500">${t.grade}-${t.cls}</div>
                 <div class="font-bold ${t.done?'text-emerald-700':'text-slate-700'}">${t.num}번</div>
                 <div class="mt-1 text-[10px] ${t.done?'text-emerald-700':'text-slate-400'}">${t.done?'✓ 완료':'미완료'}</div>
-                ${t.note?`<div class="mt-1 text-[10px] text-slate-600 bg-amber-50 border border-amber-100 rounded px-1 py-0.5 break-words" title="${escapeHtml(t.note)}">${escapeHtml(t.note)}</div>`:''}
               </div>`).join('')}
           </div>`}
     </div>
@@ -333,11 +311,8 @@ function renderAdminView() {
           <div class="mt-1">${renderClassSelector()}</div>
         </div>
         <div class="flex flex-wrap gap-2">
-          <button data-act="bulk-init" class="px-3 py-2 rounded-lg bg-sky-500 text-white text-sm">전체 초기 데이터 생성</button>
-          <button data-act="class-init" class="px-3 py-2 rounded-lg bg-sky-100 text-sky-700 border border-sky-200 text-sm">반별 초기 데이터(${UI.grade}-${UI.cls})</button>
-          <button data-act="bulk-reset" class="px-3 py-2 rounded-lg bg-rose-500 text-white text-sm">전체 초기화</button>
-          <button data-act="class-reset" class="px-3 py-2 rounded-lg bg-rose-100 text-rose-700 border border-rose-200 text-sm">반별 초기화(${UI.grade}-${UI.cls})</button>
-          <button data-act="export-xlsx" class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm">엑셀 다운로드</button>
+          <button data-act="bulk-init" class="px-3 py-2 rounded-lg bg-sky-500 text-white text-sm">초기 데이터 생성</button>
+          <button data-act="bulk-reset" class="px-3 py-2 rounded-lg bg-rose-100 text-rose-700 border border-rose-200 text-sm">전체 초기화</button>
           <button data-act="change-pw" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm">비밀번호 변경</button>
         </div>
       </div>
@@ -415,7 +390,7 @@ function renderTabletRow(t) {
       <input type="checkbox" data-tablet-field="${t.id}|done" ${t.done?'checked':''} class="w-4 h-4 accent-emerald-500"/>
     </td>
     <td class="p-2">
-      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs" placeholder="비고(100자)"/>
+      <input type="text" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" class="w-full px-2 py-1 rounded border border-slate-200 text-xs" placeholder="비고"/>
     </td>
     <td class="p-2 text-center">
       <button data-act="del-tablet" data-id="${t.id}" class="px-2 py-1 rounded bg-rose-100 text-rose-700 text-xs">삭제</button>
@@ -449,8 +424,8 @@ function renderTabletCard(t) {
         </div>`).join('')}
     </div>
     <div class="mt-2">
-      <div class="text-xs text-slate-500 mb-1">비고 (최대 100자)</div>
-      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs"/>
+      <div class="text-xs text-slate-500 mb-1">비고</div>
+      <input type="text" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" class="w-full px-2 py-1 rounded border border-slate-200 text-xs"/>
     </div>
   </div>`;
 }
@@ -546,19 +521,6 @@ function onAction(e) {
       DataStore.bulkInit(true); render();
     }
   }
-  else if (act === 'class-init') {
-    if (confirm(`${UI.grade}학년 ${UI.cls}반의 초기 데이터를 생성합니다.\n(태블릿 ${DEFAULT_TABLET_COUNT}대, 모든 항목 "O" / 완료 체크)\n기존 반 데이터는 덮어쓰여집니다.`)) {
-      DataStore.classInit(UI.grade, UI.cls); render();
-    }
-  }
-  else if (act === 'class-reset') {
-    if (confirm(`⚠️ ${UI.grade}학년 ${UI.cls}반의 모든 데이터를 삭제합니다. 계속하시겠습니까?`)) {
-      DataStore.classReset(UI.grade, UI.cls); render();
-    }
-  }
-  else if (act === 'export-xlsx') {
-    exportToExcel();
-  }
   else if (act === 'add-tablet') {
     const tablets = DataStore.getTablets(UI.grade, UI.cls);
     const maxNum = tablets.reduce((m,t)=>Math.max(m,t.num),0);
@@ -608,57 +570,6 @@ function onTabletField(el) {
   DataStore.upsertTablet(t);
   // note는 blur로 호출되므로 매번 재렌더하면 포커스 날아감 → done/location만 재렌더
   if (field !== 'note') render();
-}
-
-function exportToExcel() {
-  const all = DataStore.getAll();
-  // 시트1: 태블릿 전체
-  const tabletRows = all.tablets
-    .slice()
-    .sort((a,b) => a.grade-b.grade || a.cls-b.cls || a.num-b.num)
-    .map(t => {
-      const row = {
-        'ID': t.id,
-        '학년': t.grade,
-        '반': t.cls,
-        '번호': t.num,
-        '위치': t.location,
-      };
-      CHECK_FIELDS.forEach(f => row[f.label] = t.checks[f.key] || '-');
-      row['완료'] = t.done ? 'O' : '';
-      row['비고'] = t.note || '';
-      return row;
-    });
-  // 시트2: 충전함
-  const chargerRows = [];
-  GRADES.forEach(({grade, classes}) => {
-    for (let cls=1; cls<=classes; cls++) {
-      const c = DataStore.getCharger(grade, cls);
-      chargerRows.push({ '학년': grade, '반': cls, '먼지제거': c.dust, '라벨': c.label });
-    }
-  });
-  // 시트3: 반별 진행률(교실 기준)
-  const summaryRows = [];
-  GRADES.forEach(({grade, classes}) => {
-    for (let cls=1; cls<=classes; cls++) {
-      const tabs = all.tablets.filter(t => t.grade===grade && t.cls===cls && t.location==='교실');
-      const total = tabs.length;
-      const done = tabs.filter(t => t.done).length;
-      summaryRows.push({
-        '학년': grade, '반': cls,
-        '교실 전체': total, '완료': done,
-        '진행률(%)': total ? Math.round(done/total*100) : 0
-      });
-    }
-  });
-
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), '반별 진행률');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tabletRows), '태블릿');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(chargerRows), '충전함');
-  const today = new Date();
-  const fname = `스마트기기_점검현황_${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}.xlsx`;
-  XLSX.writeFile(wb, fname);
 }
 
 function escapeHtml(s) {
