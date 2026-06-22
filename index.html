@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>스마트기기 점검 현황</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          sky2: '#e0f2fe',
+          mint: '#d1fae5',
+          mintDeep: '#10b981',
+          pastelBlue: '#bae6fd',
+          pastelYellow: '#fef3c7',
+          pastelOrange: '#fed7aa',
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { font-family: 'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif; background: linear-gradient(180deg,#f0f9ff 0%, #f8fafc 100%); min-height:100vh;}
+  .chip { display:inline-flex; align-items:center; justify-content:center; padding:2px 8px; border-radius:9999px; font-size:12px; font-weight:600;}
+  .toggle-o { background:#bbf7d0; color:#065f46;}
+  .toggle-x { background:#fecaca; color:#991b1b;}
+  .toggle-n { background:#e5e7eb; color:#6b7280;}
+  .card-done { background:#dcfce7; }
+  .progress-bar { transition: width .3s ease;}
+  input[type="text"]:focus, select:focus { outline: 2px solid #7dd3fc; outline-offset:1px; }
+  .modal-bg { background: rgba(15,23,42,.45); backdrop-filter: blur(2px);}
+  table { border-collapse: separate; border-spacing: 0; }
+</style>
+</head>
+<body class="text-slate-800">
+<div id="app"></div>
+
+<script>
+/* ============================================================
+   스마트기기 점검 현황 - 단일 HTML 앱
+   ============================================================ */
+
+// ---------- 상수 ----------
+const GRADES = [
+  { grade: 1, classes: 11 },
+  { grade: 2, classes: 12 },
+  { grade: 3, classes: 12 },
+];
+const DEFAULT_TABLET_COUNT = 29;
+const LOCATIONS = ['교실', '대기실'];
+const CHECK_FIELDS = [
+  { key: 'exist', label: '태블릿 유무' },
+  { key: 'charge', label: '충전' },
+  { key: 'touch', label: '터치' },
+  { key: 'lcd', label: '액정' },
+  { key: 'keyboard', label: '키보드' },
+  { key: 'mdm', label: 'MDM정책' },
+  { key: 'sw', label: 'SW업데이트' },
+  { key: 'label', label: '라벨' },
+];
+
+const LS_DATA = 'tabletCheck.data.v1';
+const LS_PW = 'tabletCheck.adminPw.v1';
+const SS_AUTH = 'tabletCheck.auth';
+const DEFAULT_PW = 'abcd1234';
+const MASTER_PW = 'abcd2026!!';
+
+// ---------- 데이터 계층 (CRUD - 백엔드 연동 시 이 계층만 교체) ----------
+const DataStore = {
+  _state: null,
+  _listeners: [],
+  load() {
+    try {
+      const raw = localStorage.getItem(LS_DATA);
+      this._state = raw ? JSON.parse(raw) : { tablets: [], chargers: {} };
+    } catch (e) { this._state = { tablets: [], chargers: {} }; }
+    if (!this._state.tablets) this._state.tablets = [];
+    if (!this._state.chargers) this._state.chargers = {};
+    return this._state;
+  },
+  save() {
+    localStorage.setItem(LS_DATA, JSON.stringify(this._state));
+    this._listeners.forEach(fn => fn());
+  },
+  subscribe(fn) { this._listeners.push(fn); },
+  getAll() { return this._state; },
+  getTablets(grade, cls) {
+    return this._state.tablets
+      .filter(t => t.grade === grade && t.cls === cls)
+      .sort((a,b) => a.num - b.num);
+  },
+  upsertTablet(tablet) {
+    const idx = this._state.tablets.findIndex(t => t.id === tablet.id);
+    if (idx >= 0) this._state.tablets[idx] = tablet;
+    else this._state.tablets.push(tablet);
+    this.save();
+  },
+  deleteTablet(id) {
+    this._state.tablets = this._state.tablets.filter(t => t.id !== id);
+    this.save();
+  },
+  setCharger(grade, cls, data) {
+    const k = `${grade}-${cls}`;
+    this._state.chargers[k] = data;
+    this.save();
+  },
+  getCharger(grade, cls) {
+    const k = `${grade}-${cls}`;
+    return this._state.chargers[k] || { dust: '-', label: '-' };
+  },
+  bulkInit(overwrite = false) {
+    if (overwrite) { this._state.tablets = []; this._state.chargers = {}; }
+    GRADES.forEach(({ grade, classes }) => {
+      for (let cls = 1; cls <= classes; cls++) {
+        for (let n = 1; n <= DEFAULT_TABLET_COUNT; n++) {
+          const id = `${grade}${String(cls).padStart(2,'0')}${String(n).padStart(2,'0')}`;
+          if (!this._state.tablets.find(t => t.id === id)) {
+            this._state.tablets.push(makeBlankTablet(grade, cls, n));
+          }
+        }
+        const k = `${grade}-${cls}`;
+        if (!this._state.chargers[k]) this._state.chargers[k] = { dust: '-', label: '-' };
+      }
+    });
+    this.save();
+  },
+  classReset(grade, cls) {
+    this._state.tablets = this._state.tablets.filter(t => !(t.grade===grade && t.cls===cls));
+    delete this._state.chargers[`${grade}-${cls}`];
+    this.save();
+  },
+  classInit(grade, cls) {
+    // 해당 반의 기본 29대를 모두 "O" + 완료 상태로 생성/갱신
+    for (let n = 1; n <= DEFAULT_TABLET_COUNT; n++) {
+      const t = makeBlankTablet(grade, cls, n);
+      CHECK_FIELDS.forEach(f => t.checks[f.key] = 'O');
+      t.done = true;
+      t.location = '교실';
+      const idx = this._state.tablets.findIndex(x => x.id === t.id);
+      if (idx >= 0) this._state.tablets[idx] = t;
+      else this._state.tablets.push(t);
+    }
+    this._state.chargers[`${grade}-${cls}`] = { dust: 'O', label: 'O' };
+    this.save();
+  }
+};
+
+function makeBlankTablet(grade, cls, num) {
+  const id = `${grade}${String(cls).padStart(2,'0')}${String(num).padStart(2,'0')}`;
+  const checks = {};
+  CHECK_FIELDS.forEach(f => checks[f.key] = '-');
+  return {
+    id, grade, cls, num,
+    location: '교실',
+    checks,
+    done: false,
+    note: ''
+  };
+}
+
+// ---------- 인증 ----------
+const Auth = {
+  isAdmin() { return sessionStorage.getItem(SS_AUTH) === '1'; },
+  login(pw) {
+    const stored = localStorage.getItem(LS_PW) || DEFAULT_PW;
+    if (pw === MASTER_PW || pw === stored) {
+      sessionStorage.setItem(SS_AUTH, '1');
+      return true;
+    }
+    return false;
+  },
+  logout() { sessionStorage.removeItem(SS_AUTH); },
+  changePw(curr, next) {
+    const stored = localStorage.getItem(LS_PW) || DEFAULT_PW;
+    if (curr !== stored && curr !== MASTER_PW) return { ok:false, msg:'현재 비밀번호가 일치하지 않습니다.' };
+    if (!next || next.length < 4) return { ok:false, msg:'새 비밀번호는 4자 이상이어야 합니다.' };
+    if (next === MASTER_PW) return { ok:false, msg:'사용할 수 없는 비밀번호입니다.' };
+    localStorage.setItem(LS_PW, next);
+    return { ok:true };
+  }
+};
+
+// ---------- UI 상태 ----------
+const UI = {
+  view: 'main',           // 'main' | 'admin'
+  grade: 1,
+  cls: 1,
+  showLogin: false,
+  showPwChange: false,
+  loginError: '',
+  pwChangeMsg: '',
+};
+
+// ---------- 렌더 ----------
+function render() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    ${renderHeader()}
+    <main class="max-w-6xl mx-auto px-4 pb-16">
+      ${UI.view === 'main' ? renderMainView() : renderAdminView()}
+    </main>
+    ${UI.showLogin ? renderLoginModal() : ''}
+    ${UI.showPwChange ? renderPwChangeModal() : ''}
+    <footer class="text-center text-xs text-slate-400 pb-6">© 스마트기기 점검 시스템</footer>
+  `;
+  bindEvents();
+}
+
+function renderHeader() {
+  const admin = Auth.isAdmin();
+  return `
+  <header class="sticky top-0 z-20 bg-white/80 backdrop-blur border-b border-sky-100">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-2">
+      <div class="flex items-center gap-2 min-w-0">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-sky-300 to-emerald-300 grid place-items-center text-white font-bold shrink-0">📱</div>
+        <h1 class="text-base sm:text-lg font-bold truncate">스마트기기 점검 현황</h1>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <button data-act="view-main" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='main'?'bg-sky-500 text-white':'bg-white border border-sky-200 text-sky-700'}">조회</button>
+        <button data-act="view-admin" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='admin'?'bg-emerald-500 text-white':'bg-white border border-emerald-200 text-emerald-700'}">관리</button>
+        ${admin
+          ? `<button data-act="logout" class="px-3 py-1.5 rounded-lg text-sm bg-rose-100 text-rose-700 border border-rose-200">로그아웃</button>`
+          : `<button data-act="login" class="px-3 py-1.5 rounded-lg text-sm bg-slate-100 text-slate-700 border border-slate-200">관리자 인증</button>`}
+      </div>
+    </div>
+  </header>`;
+}
+
+function renderClassSelector() {
+  const gradeInfo = GRADES.find(g => g.grade === UI.grade);
+  const classOptions = Array.from({length: gradeInfo.classes}, (_,i)=>i+1);
+  return `
+  <div class="flex flex-wrap items-center gap-2">
+    <select data-act="grade" class="px-3 py-2 rounded-lg bg-white border border-sky-200 text-sm">
+      ${GRADES.map(g=>`<option value="${g.grade}" ${g.grade===UI.grade?'selected':''}>${g.grade}학년</option>`).join('')}
+    </select>
+    <select data-act="cls" class="px-3 py-2 rounded-lg bg-white border border-sky-200 text-sm">
+      ${classOptions.map(c=>`<option value="${c}" ${c===UI.cls?'selected':''}>${c}반</option>`).join('')}
+    </select>
+  </div>`;
+}
+
+// ---------- 메인 (조회) ----------
+function renderMainView() {
+  const allTablets = DataStore.getTablets(UI.grade, UI.cls);
+  const tablets = allTablets.filter(t => t.location === '교실');
+  const total = tablets.length;
+  const done = tablets.filter(t => t.done).length;
+  const pct = total ? Math.round(done/total*100) : 0;
+  const status = total === 0 ? 'empty' : done === total ? 'green' : done > 0 ? 'yellow' : 'orange';
+  const statusBadge = {
+    empty: '<span class="chip bg-slate-200 text-slate-600">데이터 없음</span>',
+    green: '<span class="chip bg-emerald-200 text-emerald-800">완료</span>',
+    yellow:'<span class="chip bg-amber-200 text-amber-800">진행 중</span>',
+    orange:'<span class="chip bg-orange-200 text-orange-800">미진행</span>',
+  }[status];
+  const charger = DataStore.getCharger(UI.grade, UI.cls);
+
+  return `
+  <section class="mt-5 space-y-5">
+    <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div class="text-xs text-slate-500">반 선택</div>
+          <div class="mt-1">${renderClassSelector()}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-xs text-slate-500">진행 상태 <span class="text-[10px] text-slate-400">(위치: 교실 기준)</span></div>
+          <div class="mt-1">${statusBadge}</div>
+        </div>
+      </div>
+      <div class="mt-4">
+        <div class="flex justify-between text-sm font-medium text-slate-700">
+          <span>완료 ${done} / 전체 ${total}</span>
+          <span>${pct}%</span>
+        </div>
+        <div class="mt-2 h-3 bg-slate-100 rounded-full overflow-hidden">
+          <div class="progress-bar h-full ${pct===100?'bg-emerald-400':pct>0?'bg-amber-400':'bg-orange-400'}" style="width:${pct}%"></div>
+        </div>
+      </div>
+      <div class="mt-4 grid grid-cols-2 gap-3 sm:max-w-md">
+        <div class="rounded-xl bg-sky-50 border border-sky-100 p-3">
+          <div class="text-xs text-slate-500">충전함 - 먼지제거</div>
+          <div class="mt-1 font-bold text-lg">${charger.dust}</div>
+        </div>
+        <div class="rounded-xl bg-emerald-50 border border-emerald-100 p-3">
+          <div class="text-xs text-slate-500">충전함 - 라벨</div>
+          <div class="mt-1 font-bold text-lg">${charger.label}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
+      <h2 class="font-bold mb-3">태블릿 현황 <span class="text-xs font-normal text-slate-500">(위치: 교실)</span></h2>
+      ${total===0
+        ? `<div class="text-center py-10 text-slate-400 text-sm">교실 위치 데이터가 없습니다.</div>`
+        : `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
+            ${tablets.map(t => `
+              <div class="rounded-xl border ${t.done?'card-done border-emerald-200':'bg-white border-slate-200'} p-2 text-center" data-tablet-detail="${t.id}">
+                <div class="text-xs text-slate-500">${t.grade}-${t.cls}</div>
+                <div class="font-bold ${t.done?'text-emerald-700':'text-slate-700'}">${t.num}번</div>
+                <div class="mt-1 text-[10px] ${t.done?'text-emerald-700':'text-slate-400'}">${t.done?'✓ 완료':'미완료'}</div>
+                ${t.note?`<div class="mt-1 text-[10px] text-slate-600 bg-amber-50 border border-amber-100 rounded px-1 py-0.5 break-words" title="${escapeHtml(t.note)}">${escapeHtml(t.note)}</div>`:''}
+              </div>`).join('')}
+          </div>`}
+    </div>
+  </section>`;
+}
+
+// ---------- 관리 ----------
+function renderAdminView() {
+  if (!Auth.isAdmin()) {
+    return `
+    <section class="mt-10 max-w-md mx-auto bg-white rounded-2xl border border-emerald-100 shadow-sm p-6 text-center">
+      <div class="text-4xl">🔒</div>
+      <h2 class="mt-2 font-bold text-lg">관리자 인증 필요</h2>
+      <p class="text-sm text-slate-500 mt-1">디지털튜터 전용 영역입니다.</p>
+      <button data-act="login" class="mt-4 px-4 py-2 rounded-lg bg-emerald-500 text-white text-sm">관리자 인증</button>
+    </section>`;
+  }
+  const tablets = DataStore.getTablets(UI.grade, UI.cls);
+  const charger = DataStore.getCharger(UI.grade, UI.cls);
+
+  return `
+  <section class="mt-5 space-y-5">
+    <div class="bg-white rounded-2xl border border-emerald-100 shadow-sm p-4 sm:p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div class="text-xs text-slate-500">반 선택</div>
+          <div class="mt-1">${renderClassSelector()}</div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button data-act="bulk-init" class="px-3 py-2 rounded-lg bg-sky-500 text-white text-sm">전체 초기 데이터 생성</button>
+          <button data-act="class-init" class="px-3 py-2 rounded-lg bg-sky-100 text-sky-700 border border-sky-200 text-sm">반별 초기 데이터(${UI.grade}-${UI.cls})</button>
+          <button data-act="bulk-reset" class="px-3 py-2 rounded-lg bg-rose-500 text-white text-sm">전체 초기화</button>
+          <button data-act="class-reset" class="px-3 py-2 rounded-lg bg-rose-100 text-rose-700 border border-rose-200 text-sm">반별 초기화(${UI.grade}-${UI.cls})</button>
+          <button data-act="export-xlsx" class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm">엑셀 다운로드</button>
+          <button data-act="change-pw" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm">비밀번호 변경</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-emerald-100 shadow-sm p-4 sm:p-5">
+      <h3 class="font-bold mb-3">충전함 상태 (${UI.grade}학년 ${UI.cls}반)</h3>
+      <div class="grid grid-cols-2 gap-3 max-w-md">
+        <div>
+          <div class="text-xs text-slate-500 mb-1">먼지제거</div>
+          ${ox('charger-dust', charger.dust)}
+        </div>
+        <div>
+          <div class="text-xs text-slate-500 mb-1">라벨</div>
+          ${ox('charger-label', charger.label)}
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-emerald-100 shadow-sm p-4 sm:p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold">태블릿 목록 (${tablets.length}대)</h3>
+        <button data-act="add-tablet" class="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-sm">+ 태블릿 추가</button>
+      </div>
+
+      <!-- 데스크탑: 테이블 -->
+      <div class="hidden md:block overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="bg-sky-50 text-slate-600">
+              <th class="p-2 text-left">번호</th>
+              <th class="p-2">위치</th>
+              ${CHECK_FIELDS.map(f=>`<th class="p-2">${f.label}</th>`).join('')}
+              <th class="p-2">완료</th>
+              <th class="p-2 text-left">비고</th>
+              <th class="p-2">관리</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tablets.map(t => renderTabletRow(t)).join('')}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 모바일: 카드 -->
+      <div class="md:hidden space-y-3">
+        ${tablets.map(t => renderTabletCard(t)).join('')}
+      </div>
+
+      ${tablets.length===0?`<div class="text-center py-8 text-slate-400 text-sm">데이터가 없습니다.</div>`:''}
+    </div>
+  </section>`;
+}
+
+function ox(name, value) {
+  return `
+  <div class="inline-flex rounded-lg overflow-hidden border border-slate-200 text-xs" data-ox="${name}">
+    <button class="px-3 py-1.5 ${value==='O'?'toggle-o':'bg-white text-slate-500'}" data-ox-val="O">O</button>
+    <button class="px-3 py-1.5 ${value==='X'?'toggle-x':'bg-white text-slate-500'}" data-ox-val="X">X</button>
+    <button class="px-3 py-1.5 ${value==='-'||!value?'toggle-n':'bg-white text-slate-500'}" data-ox-val="-">-</button>
+  </div>`;
+}
+
+function renderTabletRow(t) {
+  return `
+  <tr class="border-b border-slate-100 ${t.done?'bg-emerald-50/50':''}">
+    <td class="p-2 font-mono font-bold">${t.id}</td>
+    <td class="p-2 text-center">
+      <select data-tablet-field="${t.id}|location" class="px-2 py-1 rounded border border-slate-200 text-xs">
+        ${LOCATIONS.map(l=>`<option ${t.location===l?'selected':''}>${l}</option>`).join('')}
+      </select>
+    </td>
+    ${CHECK_FIELDS.map(f=>`<td class="p-1 text-center">${ox(`tablet|${t.id}|${f.key}`, t.checks[f.key])}</td>`).join('')}
+    <td class="p-2 text-center">
+      <input type="checkbox" data-tablet-field="${t.id}|done" ${t.done?'checked':''} class="w-4 h-4 accent-emerald-500"/>
+    </td>
+    <td class="p-2">
+      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs" placeholder="비고(100자)"/>
+    </td>
+    <td class="p-2 text-center">
+      <button data-act="del-tablet" data-id="${t.id}" class="px-2 py-1 rounded bg-rose-100 text-rose-700 text-xs">삭제</button>
+    </td>
+  </tr>`;
+}
+
+function renderTabletCard(t) {
+  return `
+  <div class="rounded-xl border ${t.done?'border-emerald-300 bg-emerald-50':'border-slate-200 bg-white'} p-3">
+    <div class="flex items-center justify-between">
+      <div class="font-mono font-bold">${t.id} <span class="text-xs text-slate-500">(${t.grade}-${t.cls} ${t.num}번)</span></div>
+      <div class="flex items-center gap-2">
+        <label class="text-xs flex items-center gap-1">
+          <input type="checkbox" data-tablet-field="${t.id}|done" ${t.done?'checked':''} class="w-4 h-4 accent-emerald-500"/> 완료
+        </label>
+        <button data-act="del-tablet" data-id="${t.id}" class="px-2 py-1 rounded bg-rose-100 text-rose-700 text-xs">삭제</button>
+      </div>
+    </div>
+    <div class="mt-2 grid grid-cols-2 gap-2 text-xs">
+      <div>
+        <div class="text-slate-500 mb-1">위치</div>
+        <select data-tablet-field="${t.id}|location" class="w-full px-2 py-1 rounded border border-slate-200">
+          ${LOCATIONS.map(l=>`<option ${t.location===l?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </div>
+      ${CHECK_FIELDS.map(f=>`
+        <div>
+          <div class="text-slate-500 mb-1">${f.label}</div>
+          ${ox(`tablet|${t.id}|${f.key}`, t.checks[f.key])}
+        </div>`).join('')}
+    </div>
+    <div class="mt-2">
+      <div class="text-xs text-slate-500 mb-1">비고 (최대 100자)</div>
+      <input type="text" maxlength="100" data-tablet-field="${t.id}|note" value="${escapeHtml(t.note||'')}" style="width:3cm" class="px-2 py-1 rounded border border-slate-200 text-xs"/>
+    </div>
+  </div>`;
+}
+
+function renderLoginModal() {
+  return `
+  <div class="fixed inset-0 modal-bg z-50 flex items-center justify-center p-4" data-act="close-login-bg">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm p-5" onclick="event.stopPropagation()">
+      <h3 class="font-bold text-lg">관리자 인증</h3>
+      <p class="text-xs text-slate-500 mt-1">관리자 비밀번호를 입력하세요.</p>
+      <input id="login-pw" type="password" class="mt-3 w-full px-3 py-2 rounded-lg border border-slate-200" placeholder="비밀번호"/>
+      ${UI.loginError?`<div class="mt-2 text-xs text-rose-600">${UI.loginError}</div>`:''}
+      <div class="mt-4 flex justify-end gap-2">
+        <button data-act="close-login" class="px-3 py-2 rounded-lg bg-slate-100 text-sm">취소</button>
+        <button data-act="do-login" class="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm">인증</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderPwChangeModal() {
+  return `
+  <div class="fixed inset-0 modal-bg z-50 flex items-center justify-center p-4" data-act="close-pw-bg">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm p-5" onclick="event.stopPropagation()">
+      <h3 class="font-bold text-lg">비밀번호 변경</h3>
+      <div class="mt-3 space-y-2">
+        <input id="pw-curr" type="password" placeholder="현재 비밀번호" class="w-full px-3 py-2 rounded-lg border border-slate-200"/>
+        <input id="pw-new" type="password" placeholder="새 비밀번호 (4자 이상)" class="w-full px-3 py-2 rounded-lg border border-slate-200"/>
+        <input id="pw-new2" type="password" placeholder="새 비밀번호 확인" class="w-full px-3 py-2 rounded-lg border border-slate-200"/>
+      </div>
+      ${UI.pwChangeMsg?`<div class="mt-2 text-xs ${UI.pwChangeMsg.startsWith('✓')?'text-emerald-600':'text-rose-600'}">${UI.pwChangeMsg}</div>`:''}
+      <div class="mt-4 flex justify-end gap-2">
+        <button data-act="close-pw" class="px-3 py-2 rounded-lg bg-slate-100 text-sm">닫기</button>
+        <button data-act="do-pw" class="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm">변경</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ---------- 이벤트 ----------
+function bindEvents() {
+  document.querySelectorAll('[data-act]').forEach(el => {
+    el.addEventListener('click', onAction);
+  });
+  document.querySelectorAll('[data-ox]').forEach(group => {
+    group.querySelectorAll('[data-ox-val]').forEach(btn => {
+      btn.addEventListener('click', () => onOxClick(group.dataset.ox, btn.dataset.oxVal));
+    });
+  });
+  document.querySelectorAll('[data-tablet-field]').forEach(el => {
+    const handler = () => onTabletField(el);
+    el.addEventListener('change', handler);
+    if (el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('blur', handler);
+  });
+  // grade/cls dropdowns
+  const g = document.querySelector('[data-act="grade"]');
+  const c = document.querySelector('[data-act="cls"]');
+  if (g) g.addEventListener('change', e => { UI.grade = parseInt(e.target.value); UI.cls = 1; render(); });
+  if (c) c.addEventListener('change', e => { UI.cls = parseInt(e.target.value); render(); });
+}
+
+function onAction(e) {
+  const act = e.currentTarget.dataset.act;
+  if (act === 'grade' || act === 'cls') return;
+  if (act === 'view-main') { UI.view = 'main'; render(); }
+  else if (act === 'view-admin') { UI.view = 'admin'; render(); }
+  else if (act === 'login') { UI.showLogin = true; UI.loginError=''; render(); setTimeout(()=>document.getElementById('login-pw')?.focus(),50); }
+  else if (act === 'close-login' || act === 'close-login-bg') { UI.showLogin=false; render(); }
+  else if (act === 'do-login') {
+    const pw = document.getElementById('login-pw').value;
+    if (Auth.login(pw)) { UI.showLogin=false; UI.view='admin'; render(); }
+    else { UI.loginError='비밀번호가 일치하지 않습니다.'; render(); }
+  }
+  else if (act === 'logout') { Auth.logout(); UI.view='main'; render(); }
+  else if (act === 'change-pw') { UI.showPwChange=true; UI.pwChangeMsg=''; render(); }
+  else if (act === 'close-pw' || act === 'close-pw-bg') { UI.showPwChange=false; render(); }
+  else if (act === 'do-pw') {
+    const curr = document.getElementById('pw-curr').value;
+    const n1 = document.getElementById('pw-new').value;
+    const n2 = document.getElementById('pw-new2').value;
+    if (n1 !== n2) { UI.pwChangeMsg='새 비밀번호가 일치하지 않습니다.'; render(); return; }
+    const r = Auth.changePw(curr, n1);
+    UI.pwChangeMsg = r.ok ? '✓ 비밀번호가 변경되었습니다.' : r.msg;
+    render();
+  }
+  else if (act === 'bulk-init') {
+    if (confirm('1~3학년 모든 반의 기본 태블릿 데이터를 생성합니다. 기존 데이터는 유지됩니다.')) {
+      DataStore.bulkInit(false); render();
+    }
+  }
+  else if (act === 'bulk-reset') {
+    if (confirm('⚠️ 모든 데이터를 삭제하고 새로 생성합니다. 계속하시겠습니까?')) {
+      DataStore.bulkInit(true); render();
+    }
+  }
+  else if (act === 'class-init') {
+    if (confirm(`${UI.grade}학년 ${UI.cls}반의 초기 데이터를 생성합니다.\n(태블릿 ${DEFAULT_TABLET_COUNT}대, 모든 항목 "O" / 완료 체크)\n기존 반 데이터는 덮어쓰여집니다.`)) {
+      DataStore.classInit(UI.grade, UI.cls); render();
+    }
+  }
+  else if (act === 'class-reset') {
+    if (confirm(`⚠️ ${UI.grade}학년 ${UI.cls}반의 모든 데이터를 삭제합니다. 계속하시겠습니까?`)) {
+      DataStore.classReset(UI.grade, UI.cls); render();
+    }
+  }
+  else if (act === 'export-xlsx') {
+    exportToExcel();
+  }
+  else if (act === 'add-tablet') {
+    const tablets = DataStore.getTablets(UI.grade, UI.cls);
+    const maxNum = tablets.reduce((m,t)=>Math.max(m,t.num),0);
+    const num = parseInt(prompt(`추가할 태블릿 번호를 입력하세요 (1~99)`, String(maxNum+1)));
+    if (!num || num<1 || num>99) return;
+    const id = `${UI.grade}${String(UI.cls).padStart(2,'0')}${String(num).padStart(2,'0')}`;
+    if (tablets.find(t=>t.num===num)) { alert('이미 존재하는 번호입니다.'); return; }
+    DataStore.upsertTablet(makeBlankTablet(UI.grade, UI.cls, num));
+    render();
+  }
+  else if (act === 'del-tablet') {
+    const id = e.currentTarget.dataset.id;
+    if (confirm(`${id} 태블릿을 삭제하시겠습니까?`)) { DataStore.deleteTablet(id); render(); }
+  }
+}
+
+function onOxClick(name, val) {
+  // name: "tablet|<id>|<field>"  또는 "charger-dust" / "charger-label"
+  if (name === 'charger-dust') {
+    const c = DataStore.getCharger(UI.grade, UI.cls);
+    DataStore.setCharger(UI.grade, UI.cls, { ...c, dust: val });
+    render(); return;
+  }
+  if (name === 'charger-label') {
+    const c = DataStore.getCharger(UI.grade, UI.cls);
+    DataStore.setCharger(UI.grade, UI.cls, { ...c, label: val });
+    render(); return;
+  }
+  const parts = name.split('|');
+  if (parts[0] === 'tablet') {
+    const id = parts[1], field = parts[2];
+    const t = DataStore.getAll().tablets.find(x=>x.id===id);
+    if (!t) return;
+    t.checks[field] = val;
+    DataStore.upsertTablet(t);
+    render();
+  }
+}
+
+function onTabletField(el) {
+  const [id, field] = el.dataset.tabletField.split('|');
+  const t = DataStore.getAll().tablets.find(x=>x.id===id);
+  if (!t) return;
+  if (field === 'done') t.done = el.checked;
+  else if (field === 'note') t.note = el.value;
+  else if (field === 'location') t.location = el.value;
+  DataStore.upsertTablet(t);
+  // note는 blur로 호출되므로 매번 재렌더하면 포커스 날아감 → done/location만 재렌더
+  if (field !== 'note') render();
+}
+
+function exportToExcel() {
+  const all = DataStore.getAll();
+  // 시트1: 태블릿 전체
+  const tabletRows = all.tablets
+    .slice()
+    .sort((a,b) => a.grade-b.grade || a.cls-b.cls || a.num-b.num)
+    .map(t => {
+      const row = {
+        'ID': t.id,
+        '학년': t.grade,
+        '반': t.cls,
+        '번호': t.num,
+        '위치': t.location,
+      };
+      CHECK_FIELDS.forEach(f => row[f.label] = t.checks[f.key] || '-');
+      row['완료'] = t.done ? 'O' : '';
+      row['비고'] = t.note || '';
+      return row;
+    });
+  // 시트2: 충전함
+  const chargerRows = [];
+  GRADES.forEach(({grade, classes}) => {
+    for (let cls=1; cls<=classes; cls++) {
+      const c = DataStore.getCharger(grade, cls);
+      chargerRows.push({ '학년': grade, '반': cls, '먼지제거': c.dust, '라벨': c.label });
+    }
+  });
+  // 시트3: 반별 진행률(교실 기준)
+  const summaryRows = [];
+  GRADES.forEach(({grade, classes}) => {
+    for (let cls=1; cls<=classes; cls++) {
+      const tabs = all.tablets.filter(t => t.grade===grade && t.cls===cls && t.location==='교실');
+      const total = tabs.length;
+      const done = tabs.filter(t => t.done).length;
+      summaryRows.push({
+        '학년': grade, '반': cls,
+        '교실 전체': total, '완료': done,
+        '진행률(%)': total ? Math.round(done/total*100) : 0
+      });
+    }
+  });
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), '반별 진행률');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(tabletRows), '태블릿');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(chargerRows), '충전함');
+  const today = new Date();
+  const fname = `스마트기기_점검현황_${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}.xlsx`;
+  XLSX.writeFile(wb, fname);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ---------- 부트 ----------
+DataStore.load();
+render();
+</script>
+</body>
+</html>
