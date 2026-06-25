@@ -340,7 +340,7 @@ function renderHeader() {
   </header>`;
 }
 
-function renderClassSelector() {
+function renderClassSelector(includeAll = false) {
   const gradeInfo = GRADES.find(g => g.grade === UI.grade);
   const classOptions = Array.from({length: gradeInfo.classes}, (_,i)=>i+1);
   return `
@@ -349,13 +349,88 @@ function renderClassSelector() {
       ${GRADES.map(g=>`<option value="${g.grade}" ${g.grade===UI.grade?'selected':''}>${g.grade}학년</option>`).join('')}
     </select>
     <select data-act="cls" class="px-3 py-2 rounded-lg bg-white border border-sky-200 text-sm">
+      ${includeAll ? `<option value="0" ${UI.cls===0?'selected':''}>전체(학년)</option>` : ''}
       ${classOptions.map(c=>`<option value="${c}" ${c===UI.cls?'selected':''}>${c}반</option>`).join('')}
     </select>
   </div>`;
 }
 
+// 학년 전체 조회
+function renderGradeOverview() {
+  const gradeInfo = GRADES.find(g => g.grade === UI.grade);
+  const classes = Array.from({length: gradeInfo.classes}, (_,i)=>i+1);
+  const rows = classes.map(cls => {
+    const tablets = DataStore.getTablets(UI.grade, cls).filter(t => t.location === '교실');
+    const total = tablets.length;
+    const done = tablets.filter(t => t.done).length;
+    const pct = total ? Math.round(done/total*100) : 0;
+    return { cls, total, done, pct, complete: total>0 && done===total };
+  });
+  const totalSum = rows.reduce((a,r)=>a+r.total,0);
+  const doneSum = rows.reduce((a,r)=>a+r.done,0);
+  const overallPct = totalSum ? Math.round(doneSum/totalSum*100) : 0;
+  const completeCount = rows.filter(r=>r.complete).length;
+
+  return `
+  <section class="mt-5 space-y-5">
+    <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div class="text-xs text-slate-500">반 선택</div>
+          <div class="mt-1">${renderClassSelector(true)}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-xs text-slate-500">${UI.grade}학년 전체 완료</div>
+          <div class="mt-1 font-bold text-lg">${completeCount} / ${rows.length} 반 완료</div>
+        </div>
+      </div>
+      <div class="mt-4">
+        <div class="flex justify-between text-sm font-medium text-slate-700">
+          <span>전체 완료 ${doneSum} / ${totalSum} 대</span>
+          <span>${overallPct}%</span>
+        </div>
+        <div class="mt-2 h-3 bg-slate-100 rounded-full overflow-hidden">
+          <div class="progress-bar h-full ${overallPct===100?'bg-emerald-400':overallPct>0?'bg-amber-400':'bg-orange-400'}" style="width:${overallPct}%"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
+      <h2 class="font-bold mb-3">${UI.grade}학년 반별 진행 현황</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        ${rows.map(r => {
+          const badge = r.total===0
+            ? '<span class="chip bg-slate-200 text-slate-600">데이터 없음</span>'
+            : r.complete
+              ? '<span class="chip bg-emerald-200 text-emerald-800">완료</span>'
+              : r.done>0
+                ? '<span class="chip bg-amber-200 text-amber-800">진행 중</span>'
+                : '<span class="chip bg-orange-200 text-orange-800">미완료</span>';
+          const barColor = r.pct===100?'bg-emerald-400':r.pct>0?'bg-amber-400':'bg-orange-400';
+          return `
+          <button data-act="goto-cls" data-cls="${r.cls}" class="text-left rounded-xl border ${r.complete?'border-emerald-200 bg-emerald-50/50':'border-slate-200 bg-white'} p-3 hover:shadow-sm transition">
+            <div class="flex items-center justify-between">
+              <div class="font-bold text-slate-700">${UI.grade}학년 ${r.cls}반</div>
+              ${badge}
+            </div>
+            <div class="mt-2 flex justify-between text-xs text-slate-600">
+              <span>완료 ${r.done} / 전체 ${r.total}</span>
+              <span class="font-medium">${r.pct}%</span>
+            </div>
+            <div class="mt-1 h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div class="h-full ${barColor}" style="width:${r.pct}%"></div>
+            </div>
+          </button>`;
+        }).join('')}
+      </div>
+      <div class="mt-3 text-xs text-slate-400">반 카드를 클릭하면 해당 반 상세 화면으로 이동합니다. (위치: 교실 기준)</div>
+    </div>
+  </section>`;
+}
+
 // ---------- 메인 (조회) ----------
 function renderMainView() {
+  if (UI.cls === 0) return renderGradeOverview();
   const allTablets = DataStore.getTablets(UI.grade, UI.cls);
   const tablets = allTablets.filter(t => t.location === '교실');
   const total = tablets.length;
@@ -376,7 +451,7 @@ function renderMainView() {
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div class="text-xs text-slate-500">반 선택</div>
-          <div class="mt-1">${renderClassSelector()}</div>
+          <div class="mt-1">${renderClassSelector(true)}</div>
         </div>
         <div class="text-right">
           <div class="text-xs text-slate-500">진행 상태 <span class="text-[10px] text-slate-400">(위치: 교실 기준)</span></div>
@@ -432,6 +507,7 @@ function renderAdminView() {
       <button data-act="login" class="mt-4 px-4 py-2 rounded-lg bg-emerald-500 text-white text-sm">관리자 인증</button>
     </section>`;
   }
+  if (UI.cls === 0) UI.cls = 1;
   const tablets = DataStore.getTablets(UI.grade, UI.cls);
   const charger = DataStore.getCharger(UI.grade, UI.cls);
 
@@ -624,7 +700,8 @@ async function onAction(e) {
   const act = e.currentTarget.dataset.act;
   if (act === 'grade' || act === 'cls') return;
   if (act === 'view-main') { UI.view = 'main'; render(); }
-  else if (act === 'view-admin') { UI.view = 'admin'; render(); }
+  else if (act === 'view-admin') { if (UI.cls === 0) UI.cls = 1; UI.view = 'admin'; render(); }
+  else if (act === 'goto-cls') { UI.cls = parseInt(e.currentTarget.dataset.cls); render(); }
   else if (act === 'login') { UI.showLogin = true; UI.loginError=''; render(); setTimeout(()=>document.getElementById('login-pw')?.focus(),50); }
   else if (act === 'close-login' || act === 'close-login-bg') { UI.showLogin=false; render(); }
   else if (act === 'do-login') {
