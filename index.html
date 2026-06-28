@@ -61,13 +61,13 @@ const GRADES = [
 const DEFAULT_TABLET_COUNT = 29;
 const LOCATIONS = ['교실', '대기실'];
 const CHECK_FIELDS = [
-  { key: 'exist', label: '태블릿 유무' },
+  { key: 'exist', label: '유무' },
   { key: 'charge', label: '충전' },
-  { key: 'touch', label: '터치' },
+  { key: 'cable', label: '케이블' },
   { key: 'lcd', label: '액정' },
   { key: 'keyboard', label: '키보드' },
-  { key: 'mdm', label: 'MDM정책' },
-  { key: 'sw', label: 'SW업데이트' },
+  { key: 'mdm', label: 'MDM' },
+  { key: 'os', label: 'OS' },
   { key: 'label', label: '라벨' },
 ];
 
@@ -75,9 +75,18 @@ const SS_AUTH = 'tabletCheck.auth';
 const DEFAULT_PW = 'abcd1234';
 const MASTER_PW = 'abcd2026!!';
 
+const CHARGER_FIELDS = [
+  { key: 'dust', label: '먼지제거' },
+  { key: 'label', label: '라벨' },
+];
+function categoryLabel(key) {
+  const f = CHECK_FIELDS.find(x=>x.key===key) || CHARGER_FIELDS.find(x=>x.key===key);
+  return f ? f.label : key;
+}
+
 // ---------- 데이터 계층 (Supabase + 메모리 캐시 + 실시간 구독) ----------
 const DataStore = {
-  _state: { tablets: [], chargers: {}, adminPw: DEFAULT_PW, ready: false, online: false },
+  _state: { tablets: [], chargers: {}, issues: [], adminPw: DEFAULT_PW, ready: false, online: false },
   _listeners: [],
   subscribe(fn) { this._listeners.push(fn); },
   _notify() { this._listeners.forEach(fn => fn()); },
@@ -109,17 +118,28 @@ const DataStore = {
   },
 
   async _refetch() {
-    const [tRes, cRes] = await Promise.all([
-      sb.from('tablets').select('*'),
-      sb.from('chargers').select('*'),
+    // Supabase 기본 1000행 제한 → 페이지네이션으로 전체 로드
+    const PAGE = 1000;
+    let allTablets = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await sb.from('tablets').select('*')
+        .order('grade').order('cls').order('num')
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      allTablets = allTablets.concat(data || []);
+      if (!data || data.length < PAGE) break;
+    }
+    const [cRes, iRes] = await Promise.all([
+      sb.from('chargers').select('*').range(0, 9999),
+      sb.from('issues').select('*').order('created_at', { ascending: false }).range(0, 9999),
     ]);
-    if (tRes.error) throw tRes.error;
     if (cRes.error) throw cRes.error;
-    this._state.tablets = (tRes.data || []).map(rowToTablet);
+    this._state.tablets = allTablets.map(rowToTablet);
     this._state.chargers = {};
     (cRes.data || []).forEach(c => {
       this._state.chargers[`${c.grade}-${c.cls}`] = { dust: c.dust, label: c.label };
     });
+    this._state.issues = iRes.error ? [] : (iRes.data || []);
     this._notify();
   },
 
@@ -149,7 +169,43 @@ const DataStore = {
           this._state.adminPw = payload.new.value;
         }
       })
+      .on('postgres_changes', { event:'*', schema:'public', table:'issues' }, payload => {
+        if (payload.eventType === 'DELETE') {
+          this._state.issues = this._state.issues.filter(i => i.id !== payload.old.id);
+        } else {
+          const it = payload.new;
+          const i = this._state.issues.findIndex(x => x.id === it.id);
+          if (i >= 0) this._state.issues[i] = it;
+          else this._state.issues.unshift(it);
+        }
+        this._notify();
+      })
       .subscribe();
+  },
+
+  async addIssue(issue) {
+    const { error } = await sb.from('issues').insert(issue);
+    if (error) { alert('이슈 등록 실패: ' + error.message); return; }
+    await this._refetch();
+  },
+  async resolveIssue(id, resolution) {
+    const { error } = await sb.from('issues').update({
+      status: 'resolved', resolution: resolution || '', resolved_at: new Date().toISOString()
+    }).eq('id', id);
+    if (error) { alert('처리 실패: ' + error.message); return; }
+    await this._refetch();
+  },
+  async reopenIssue(id) {
+    const { error } = await sb.from('issues').update({
+      status: 'open', resolved_at: null
+    }).eq('id', id);
+    if (error) { alert('재오픈 실패: ' + error.message); return; }
+    await this._refetch();
+  },
+  async deleteIssue(id) {
+    const { error } = await sb.from('issues').delete().eq('id', id);
+    if (error) { alert('삭제 실패: ' + error.message); return; }
+    await this._refetch();
   },
 
   async upsertTablet(t) {
@@ -297,20 +353,29 @@ const UI = {
   showPwChange: false,
   loginError: '',
   pwChangeMsg: '',
+  // 이슈 모달
+  issueModal: null,    // { mode:'create'|'resolve', target_type, target_id, grade, cls, num, category_key, category_label, issueId? }
+  // 이슈 화면 필터
+  issueFilter: { grade: 0, cls: 0, status: 'open' },
 };
 
 // ---------- 렌더 ----------
 function render() {
   const app = document.getElementById('app');
+  const body =
+    UI.view === 'main'   ? renderMainView() :
+    UI.view === 'issues' ? renderIssuesView() :
+                           renderAdminView();
   app.innerHTML = `
     ${renderHeader()}
     <main class="max-w-6xl mx-auto px-4 pb-16">
       ${!DataStore._state.ready
         ? `<div class="mt-10 text-center text-slate-500 text-sm">데이터 불러오는 중…</div>`
-        : (UI.view === 'main' ? renderMainView() : renderAdminView())}
+        : body}
     </main>
     ${UI.showLogin ? renderLoginModal() : ''}
     ${UI.showPwChange ? renderPwChangeModal() : ''}
+    ${UI.issueModal ? renderIssueModal() : ''}
     <footer class="text-center text-xs text-slate-400 pb-6">© 스마트기기 점검 시스템 · 실시간 동기화</footer>
   `;
   bindEvents();
@@ -331,6 +396,7 @@ function renderHeader() {
       </div>
       <div class="flex items-center gap-2 shrink-0">
         <button data-act="view-main" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='main'?'bg-sky-500 text-white':'bg-white border border-sky-200 text-sky-700'}">조회</button>
+        <button data-act="view-issues" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='issues'?'bg-amber-500 text-white':'bg-white border border-amber-200 text-amber-700'}">이슈${openIssueCount()?` <span class="ml-1 text-[10px] bg-rose-500 text-white px-1.5 rounded-full">${openIssueCount()}</span>`:''}</button>
         <button data-act="view-admin" class="px-3 py-1.5 rounded-lg text-sm ${UI.view==='admin'?'bg-emerald-500 text-white':'bg-white border border-emerald-200 text-emerald-700'}">관리</button>
         ${admin
           ? `<button data-act="logout" class="px-3 py-1.5 rounded-lg text-sm bg-rose-100 text-rose-700 border border-rose-200">로그아웃</button>`
@@ -360,7 +426,7 @@ function renderGradeOverview() {
   const gradeInfo = GRADES.find(g => g.grade === UI.grade);
   const classes = Array.from({length: gradeInfo.classes}, (_,i)=>i+1);
   const rows = classes.map(cls => {
-    const tablets = DataStore.getTablets(UI.grade, cls).filter(t => t.location === '교실');
+    const tablets = DataStore.getTablets(UI.grade, cls);
     const total = tablets.length;
     const done = tablets.filter(t => t.done).length;
     const pct = total ? Math.round(done/total*100) : 0;
@@ -431,8 +497,7 @@ function renderGradeOverview() {
 // ---------- 메인 (조회) ----------
 function renderMainView() {
   if (UI.cls === 0) return renderGradeOverview();
-  const allTablets = DataStore.getTablets(UI.grade, UI.cls);
-  const tablets = allTablets.filter(t => t.location === '교실');
+  const tablets = DataStore.getTablets(UI.grade, UI.cls);
   const total = tablets.length;
   const done = tablets.filter(t => t.done).length;
   const pct = total ? Math.round(done/total*100) : 0;
@@ -454,7 +519,7 @@ function renderMainView() {
           <div class="mt-1">${renderClassSelector(true)}</div>
         </div>
         <div class="text-right">
-          <div class="text-xs text-slate-500">진행 상태 <span class="text-[10px] text-slate-400">(위치: 교실 기준)</span></div>
+          <div class="text-xs text-slate-500">진행 상태</div>
           <div class="mt-1">${statusBadge}</div>
         </div>
       </div>
@@ -480,7 +545,7 @@ function renderMainView() {
     </div>
 
     <div class="bg-white rounded-2xl border border-sky-100 shadow-sm p-4 sm:p-5">
-      <h2 class="font-bold mb-3">태블릿 현황 <span class="text-xs font-normal text-slate-500">(위치: 교실)</span></h2>
+      <h2 class="font-bold mb-3">태블릿 현황</h2>
       ${total===0
         ? `<div class="text-center py-10 text-slate-400 text-sm">교실 위치 데이터가 없습니다.</div>`
         : `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
@@ -694,12 +759,19 @@ function bindEvents() {
   const c = document.querySelector('[data-act="cls"]');
   if (g) g.addEventListener('change', e => { UI.grade = parseInt(e.target.value); UI.cls = 1; render(); });
   if (c) c.addEventListener('change', e => { UI.cls = parseInt(e.target.value); render(); });
+  const ifg = document.querySelector('[data-act="issue-filter-grade"]');
+  const ifc = document.querySelector('[data-act="issue-filter-cls"]');
+  const ifs = document.querySelector('[data-act="issue-filter-status"]');
+  if (ifg) ifg.addEventListener('change', e => { UI.issueFilter.grade = parseInt(e.target.value); UI.issueFilter.cls = 0; render(); });
+  if (ifc) ifc.addEventListener('change', e => { UI.issueFilter.cls = parseInt(e.target.value); render(); });
+  if (ifs) ifs.addEventListener('change', e => { UI.issueFilter.status = e.target.value; render(); });
 }
 
 async function onAction(e) {
   const act = e.currentTarget.dataset.act;
   if (act === 'grade' || act === 'cls') return;
   if (act === 'view-main') { UI.view = 'main'; render(); }
+  else if (act === 'view-issues') { UI.view = 'issues'; render(); }
   else if (act === 'view-admin') { if (UI.cls === 0) UI.cls = 1; UI.view = 'admin'; render(); }
   else if (act === 'goto-cls') { UI.cls = parseInt(e.currentTarget.dataset.cls); render(); }
   else if (act === 'login') { UI.showLogin = true; UI.loginError=''; render(); setTimeout(()=>document.getElementById('login-pw')?.focus(),50); }
@@ -762,6 +834,48 @@ async function onAction(e) {
     const id = e.currentTarget.dataset.id;
     if (confirm(`${id} 태블릿을 삭제하시겠습니까?`)) { await DataStore.deleteTablet(id); }
   }
+  else if (act === 'close-issue' || act === 'close-issue-bg') { UI.issueModal = null; render(); }
+  else if (act === 'do-issue-create') {
+    if (!requireAdmin()) return;
+    const desc = (document.getElementById('issue-desc')?.value || '').trim();
+    if (!desc) { alert('문제 내용을 입력하세요.'); return; }
+    const m = UI.issueModal;
+    await DataStore.addIssue({
+      target_type: m.target_type, target_id: m.target_id,
+      grade: m.grade, cls: m.cls, num: m.num,
+      category_key: m.category_key, category_label: m.category_label,
+      description: desc, status: 'open',
+    });
+    UI.issueModal = null; render();
+  }
+  else if (act === 'open-resolve') {
+    if (!requireAdmin()) return;
+    const id = e.currentTarget.dataset.id;
+    const it = DataStore._state.issues.find(x=>x.id===id);
+    if (!it) return;
+    UI.issueModal = { mode:'resolve', issueId:id, issue:it };
+    render();
+    setTimeout(()=>document.getElementById('issue-resolution')?.focus(),50);
+  }
+  else if (act === 'do-issue-resolve') {
+    if (!requireAdmin()) return;
+    const resv = (document.getElementById('issue-resolution')?.value || '').trim();
+    await DataStore.resolveIssue(UI.issueModal.issueId, resv);
+    UI.issueModal = null; render();
+  }
+  else if (act === 'reopen-issue') {
+    if (!requireAdmin()) return;
+    if (confirm('이 이슈를 다시 미처리 상태로 되돌리시겠습니까?')) {
+      await DataStore.reopenIssue(e.currentTarget.dataset.id);
+    }
+  }
+  else if (act === 'del-issue') {
+    if (!requireAdmin()) return;
+    if (confirm('이 이슈 기록을 삭제하시겠습니까?')) {
+      await DataStore.deleteIssue(e.currentTarget.dataset.id);
+    }
+  }
+  else if (act === 'issue-filter-grade' || act === 'issue-filter-cls' || act === 'issue-filter-status') return;
 }
 
 async function onOxClick(name, val) {
@@ -769,11 +883,13 @@ async function onOxClick(name, val) {
   if (name === 'charger-dust') {
     const c = DataStore.getCharger(UI.grade, UI.cls);
     await DataStore.setCharger(UI.grade, UI.cls, { ...c, dust: val });
+    if (val === 'X') openCreateIssueModal({ target_type:'charger', target_id:null, grade:UI.grade, cls:UI.cls, num:null, category_key:'dust' });
     return;
   }
   if (name === 'charger-label') {
     const c = DataStore.getCharger(UI.grade, UI.cls);
     await DataStore.setCharger(UI.grade, UI.cls, { ...c, label: val });
+    if (val === 'X') openCreateIssueModal({ target_type:'charger', target_id:null, grade:UI.grade, cls:UI.cls, num:null, category_key:'label' });
     return;
   }
   const parts = name.split('|');
@@ -782,8 +898,24 @@ async function onOxClick(name, val) {
     const t = DataStore.getAll().tablets.find(x=>x.id===id);
     if (!t) return;
     t.checks = { ...t.checks, [field]: val };
+    // 유무~라벨 모든 항목이 'O'면 자동 완료 체크, 아니면 해제
+    t.done = CHECK_FIELDS.every(f => t.checks[f.key] === 'O');
     await DataStore.upsertTablet(t);
+    if (val === 'X') openCreateIssueModal({ target_type:'tablet', target_id:t.id, grade:t.grade, cls:t.cls, num:t.num, category_key:field });
   }
+}
+
+function openCreateIssueModal(ctx) {
+  UI.issueModal = {
+    mode: 'create',
+    target_type: ctx.target_type,
+    target_id: ctx.target_id,
+    grade: ctx.grade, cls: ctx.cls, num: ctx.num,
+    category_key: ctx.category_key,
+    category_label: categoryLabel(ctx.category_key),
+  };
+  render();
+  setTimeout(()=>document.getElementById('issue-desc')?.focus(), 50);
 }
 
 async function onTabletField(el) {
@@ -836,6 +968,135 @@ function exportToExcel() {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+// ---------- 이슈 화면/모달 ----------
+function openIssueCount() {
+  return (DataStore._state.issues || []).filter(i => i.status === 'open').length;
+}
+
+function formatDate(s) {
+  if (!s) return '';
+  const d = new Date(s);
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function issueTargetLabel(it) {
+  if (it.target_type === 'tablet') return `${it.grade}-${it.cls} ${it.num}번`;
+  return `${it.grade}-${it.cls} 충전함`;
+}
+
+function renderIssuesView() {
+  const f = UI.issueFilter;
+  const gradeInfo = f.grade ? GRADES.find(g=>g.grade===f.grade) : null;
+  const clsOptions = gradeInfo ? Array.from({length:gradeInfo.classes},(_,i)=>i+1) : [];
+  const all = DataStore._state.issues || [];
+  const filtered = all.filter(i =>
+    (!f.grade || i.grade === f.grade) &&
+    (!f.cls || i.cls === f.cls) &&
+    (f.status === 'all' || i.status === f.status)
+  );
+  const openCnt = all.filter(i=>i.status==='open').length;
+  const resCnt  = all.filter(i=>i.status==='resolved').length;
+
+  return `
+  <section class="mt-5 space-y-5">
+    <div class="bg-white rounded-2xl border border-amber-100 shadow-sm p-4 sm:p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="font-bold text-lg">이슈 관리</h2>
+        <div class="flex gap-3 text-sm">
+          <span class="chip bg-rose-100 text-rose-700">미처리 ${openCnt}</span>
+          <span class="chip bg-emerald-100 text-emerald-700">처리완료 ${resCnt}</span>
+        </div>
+      </div>
+      <div class="mt-3 flex flex-wrap gap-2">
+        <select data-act="issue-filter-grade" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm">
+          <option value="0" ${f.grade===0?'selected':''}>전체 학년</option>
+          ${GRADES.map(g=>`<option value="${g.grade}" ${g.grade===f.grade?'selected':''}>${g.grade}학년</option>`).join('')}
+        </select>
+        <select data-act="issue-filter-cls" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm" ${!gradeInfo?'disabled':''}>
+          <option value="0" ${f.cls===0?'selected':''}>전체 반</option>
+          ${clsOptions.map(c=>`<option value="${c}" ${c===f.cls?'selected':''}>${c}반</option>`).join('')}
+        </select>
+        <select data-act="issue-filter-status" class="px-3 py-2 rounded-lg bg-white border border-slate-200 text-sm">
+          <option value="open" ${f.status==='open'?'selected':''}>미처리</option>
+          <option value="resolved" ${f.status==='resolved'?'selected':''}>처리완료</option>
+          <option value="all" ${f.status==='all'?'selected':''}>전체</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-amber-100 shadow-sm p-4 sm:p-5">
+      ${filtered.length===0
+        ? `<div class="text-center py-10 text-slate-400 text-sm">해당 조건의 이슈가 없습니다.</div>`
+        : `<ul class="divide-y divide-slate-100">
+            ${filtered.map(it => `
+              <li class="py-3">
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="chip ${it.status==='open'?'bg-rose-100 text-rose-700':'bg-emerald-100 text-emerald-700'}">${it.status==='open'?'미처리':'처리완료'}</span>
+                      <span class="chip bg-sky-100 text-sky-700">${escapeHtml(issueTargetLabel(it))}</span>
+                      <span class="chip bg-amber-100 text-amber-700">${escapeHtml(it.category_label)}</span>
+                      <span class="text-[11px] text-slate-400">등록 ${formatDate(it.created_at)}</span>
+                      ${it.resolved_at?`<span class="text-[11px] text-emerald-500">처리 ${formatDate(it.resolved_at)}</span>`:''}
+                    </div>
+                    <div class="mt-1 text-sm text-slate-700 whitespace-pre-wrap break-words">${escapeHtml(it.description||'')}</div>
+                    ${it.resolution?`<div class="mt-1 text-xs text-emerald-700 bg-emerald-50 border border-emerald-100 rounded px-2 py-1 whitespace-pre-wrap break-words"><b>처리내용:</b> ${escapeHtml(it.resolution)}</div>`:''}
+                  </div>
+                  <div class="flex flex-col gap-1 shrink-0">
+                    ${it.status==='open'
+                      ? `<button data-act="open-resolve" data-id="${it.id}" class="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-xs">처리완료</button>`
+                      : `<button data-act="reopen-issue" data-id="${it.id}" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-700 border border-slate-200 text-xs">다시 미처리</button>`}
+                    <button data-act="del-issue" data-id="${it.id}" class="px-3 py-1.5 rounded-lg bg-rose-100 text-rose-700 text-xs">삭제</button>
+                  </div>
+                </div>
+              </li>`).join('')}
+          </ul>`}
+    </div>
+  </section>`;
+}
+
+function renderIssueModal() {
+  const m = UI.issueModal;
+  if (m.mode === 'create') {
+    return `
+    <div class="fixed inset-0 modal-bg z-50 flex items-center justify-center p-4" data-act="close-issue-bg">
+      <div class="bg-white rounded-2xl shadow-xl w-full max-w-md p-5" onclick="event.stopPropagation()">
+        <h3 class="font-bold text-lg">문제 사항 등록</h3>
+        <div class="mt-2 flex flex-wrap gap-2 text-xs">
+          <span class="chip bg-sky-100 text-sky-700">${escapeHtml(issueTargetLabel(m))}</span>
+          <span class="chip bg-amber-100 text-amber-700">${escapeHtml(m.category_label)}</span>
+        </div>
+        <label class="block text-xs text-slate-500 mt-3 mb-1">문제 내용</label>
+        <textarea id="issue-desc" rows="4" maxlength="300" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="예) 액정 우측 하단 깨짐, 충전 시 인식 안됨 등"></textarea>
+        <div class="mt-4 flex justify-end gap-2">
+          <button data-act="close-issue" class="px-3 py-2 rounded-lg bg-slate-100 text-sm">취소</button>
+          <button data-act="do-issue-create" class="px-3 py-2 rounded-lg bg-rose-500 text-white text-sm">이슈 등록</button>
+        </div>
+      </div>
+    </div>`;
+  }
+  // resolve
+  const it = m.issue;
+  return `
+  <div class="fixed inset-0 modal-bg z-50 flex items-center justify-center p-4" data-act="close-issue-bg">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-md p-5" onclick="event.stopPropagation()">
+      <h3 class="font-bold text-lg">이슈 처리</h3>
+      <div class="mt-2 flex flex-wrap gap-2 text-xs">
+        <span class="chip bg-sky-100 text-sky-700">${escapeHtml(issueTargetLabel(it))}</span>
+        <span class="chip bg-amber-100 text-amber-700">${escapeHtml(it.category_label)}</span>
+      </div>
+      <div class="mt-2 text-sm text-slate-700 bg-slate-50 rounded p-2 whitespace-pre-wrap break-words">${escapeHtml(it.description||'')}</div>
+      <label class="block text-xs text-slate-500 mt-3 mb-1">처리 내용 (선택)</label>
+      <textarea id="issue-resolution" rows="3" maxlength="300" class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" placeholder="예) 액정 교체, MDM 재설치 완료"></textarea>
+      <div class="mt-4 flex justify-end gap-2">
+        <button data-act="close-issue" class="px-3 py-2 rounded-lg bg-slate-100 text-sm">취소</button>
+        <button data-act="do-issue-resolve" class="px-3 py-2 rounded-lg bg-emerald-500 text-white text-sm">처리완료</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 // ---------- 부트 ----------
